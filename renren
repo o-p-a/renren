@@ -1,0 +1,259 @@
+#! /usr/bin/ruby -E:UTF-8
+# -*- mode:Ruby; tab-width:4; coding:UTF-8; -*-
+# vi:set ft=ruby ts=4 fenc=UTF-8 :
+#----------------------------------------------------------------
+# 連番リネーム
+#
+# 2012/08/15 opa
+#----------------------------------------------------------------
+
+require 'optparse'
+require 'fileutils'
+
+ProgName = 'renren'
+Version = '1.01'
+#=====dpk===== Copyright2012
+Copyright = "Copyright (c) 2012,2013 by opa"
+#=====dpk=====
+
+#=====dpk===== compare4sort
+# 記号は先 / 数字は数値順 / 大文字小文字意識しない(全く同じ場合は意識) で比較する
+module Kernel
+ module_function
+	def compare4sort(a, b)
+		(xa, xb) = [a, b].map do |s; r|
+			(r, s) = "", s.gsub(/(\d{1,20})/) { ("00000000000000000000" + $1)[-20, 20] }
+			s.each_char do |c|
+				r << case c
+				 when /[\s!"\#$%&'()*+,-.\/:;<=>?@\[\\\]^_`{|}~]/;	"a"
+				 when /\d/;											"b"
+				 when /[a-z]/i;										"c"
+				 else;												"z"
+				end
+				r << c
+			end
+			r
+		end
+		return [xa.downcase, xa, a] <=> [xb.downcase, xb, b]
+	end
+end
+#=====dpk=====
+
+def var_init
+	# 連番の初期値
+	$origin = 1
+	# 連番の桁数
+	$column = 3
+	# 連番の前につける文字列
+	$prefix = ""
+	# 連番の後につける文字列
+	$suffix = ""
+	# ソート順 (name/time/size)
+	$sort = :name
+	# 逆順にするかどうか
+	$reverse = false
+	# 実際に実行しないかどうか
+	$dryrun = false
+	# 実行する内容を表示するかどうか
+	$verbose = false
+end
+
+# ファイル名の比較
+if File::FNM_SYSCASE == 0
+	def same_filename(a, b)
+		return a == b
+	end
+else
+	def same_filename(a, b)
+		return a.casecmp(b) == 0
+	end
+end
+
+# files中にfilenameがあるかどうか調べる
+def find_by_oldname(files, filename)
+	files.each do |v|
+		if same_filename(v[:oldname], filename)
+			return v
+		end
+	end
+	return nil
+end
+
+# ファイル名の一時変更のため、存在しないファイル名を返す
+def get_unique_filename()
+	begin
+		tmpname = $prefix + rand(99999999).to_s + $suffix
+		tmpname = File.absolute_path(tmpname)
+	end while File.exist?(tmpname)
+	return tmpname
+end
+
+# アクセス不可のときはリトライするmv
+def mv_with_retry(fileutils, from, to)
+	begin
+		fileutils.mv(from, to)
+	rescue Errno::EACCES
+		$stderr.printf("%s: file in use, retrying: %s\n", ProgName, from)
+		sleep(1)
+		retry
+	end
+end
+
+# リネーム実行
+def do_renren(names)
+
+	# ターゲットを配列に格納
+	files = []
+	names.each do |name|
+		absname = File.absolute_path(name)
+		stat = File.stat(absname)
+		if stat.file?
+			files.push(oldname:absname, time:stat.mtime, size:stat.size)
+		else
+			$stderr.printf("%s: not a file, skip: %s\n", ProgName, name)
+		end
+	end
+
+	# ソート
+	files.sort! do |a, b|
+		case $sort
+		  when :name
+			#NOP
+		  when :time
+			cmp = a[:time] <=> b[:time]
+			next cmp  if cmp != 0
+		  when :size
+			cmp = a[:size] <=> b[:size]
+			next cmp  if cmp != 0
+		  else
+			fail
+		end
+
+		cmp = compare4sort(File.basename(a[:oldname], ".*"), File.basename(b[:oldname], ".*"))
+		next cmp  if cmp != 0
+
+		cmp = compare4sort(File.basename(a[:oldname]), File.basename(b[:oldname]))
+		next cmp  if cmp != 0
+
+		next compare4sort(a[:oldname], b[:oldname])
+	end
+
+	# 逆順の場合、ひっくり返す
+	if $reverse
+		files.reverse!
+	end
+
+	# 連番を付与し新ファイル名を決定する
+	n = $origin
+	files.map! do |v|
+		newname = $prefix + sprintf("%0*d", $column, n) + $suffix + File.extname(v[:oldname]).downcase
+		v[:newname] = File.absolute_path(newname)
+		n += 1
+		v
+	end
+
+	# ファイル操作を行うオブジェクトを決定
+	if $dryrun
+		fu = FileUtils::DryRun
+	elsif $verbose
+		fu = FileUtils::Verbose
+	else
+		fu = FileUtils
+	end
+
+	# リネームを実行
+	files.shuffle.each do |v|
+		# リネームしたい名前で既にファイルがある場合
+		if File.exist?(v[:newname])
+			conflict = find_by_oldname(files, v[:newname])
+			if conflict
+				# そしてそのファイルは別の名前にリネームする予定の場合
+				tmpname = get_unique_filename()
+				mv_with_retry(fu, conflict[:oldname], tmpname)
+				conflict[:oldname] = tmpname
+			else
+				# 別の名前にリネームする予定がない場合、スキップ
+p "".encoding
+p v[:oldname].encoding
+p v[:newname].encoding
+				$stderr.printf("%s: already exist, skip: %s -> %s\n", ProgName, v[:oldname], v[:newname])
+				next
+			end
+		end
+
+		mv_with_retry(fu, v[:oldname], v[:newname])
+	end
+end
+
+def main(argv)
+	var_init()
+
+	argv.options do |opt|
+		opt.banner = "Usage: #{ProgName} [options] file..."
+
+		opt.on('-o', '--origin=n', Integer,
+			'連番初期値') do |v|
+			$origin = v
+		end
+
+		opt.on('-c', '--column=n', Integer,
+			'連番の桁数') do |v|
+			$column = v
+		end
+
+		opt.on('-p', '--prefix=str', String,
+			'連番の前に付ける文字列') do |v|
+			$prefix = v
+		end
+
+		opt.on('-x', '--suffix=str', String,
+			'連番の後に付ける文字列') do |v|
+			$suffix = v
+		end
+
+		opt.on('-s', '--sort=str', String, /name|time|size/i,
+			'ソート順(name|time|size)') do |v|
+			$sort = v.downcase.to_sym
+		end
+
+		opt.on('-r', '--reverse', TrueClass,
+			'逆順にする') do |v|
+			$reverse = v
+		end
+
+		opt.on('-d', '--dry-run', TrueClass,
+			'リネームを行わない') do |v|
+			$dryrun = v
+		end
+
+		opt.on('-v', '--verbose', TrueClass,
+			'経過表示する') do |v|
+			$verbose = v
+		end
+
+		opt.parse!
+		print(opt.help)  if argv.size == 0
+	end
+
+	files = []
+	argv.each do |a|
+		if !File.exist?(a)
+			fail("file not exist: " + a)
+		end
+
+		files.push(a.encode)
+	end
+
+	if files.size > 0
+		do_renren(files)
+	end
+
+	return 0
+end
+
+begin
+	exit main(ARGV)
+ rescue => e
+	$stderr.printf("%s: %s\n", ProgName, e)
+	exit 100
+end
